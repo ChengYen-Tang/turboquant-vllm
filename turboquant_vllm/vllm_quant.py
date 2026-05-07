@@ -95,15 +95,18 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
     norms_shards = getattr(layer, "_tq_norms_shards", {})
     shard_order = _ordered_shard_keys(list(getattr(layer, "_tq_shard_order", [])))
     if not packed_shards or not norms_shards:
-        return None
+        raise RuntimeError(
+            "TQ3 packed load expected both .tq_packed and .tq_norms shards, but some are missing."
+        )
     missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
     if missing:
-        logger.warning("TQ3 packed load: missing shards for %s", missing)
-        return None
+        raise RuntimeError(f"TQ3 packed load missing shards: {missing}")
     packed = torch.cat([packed_shards[key] for key in shard_order], dim=0)
     norms = torch.cat([norms_shards[key] for key in shard_order], dim=0)
     if norms.shape[1] != n_groups:
-        logger.warning("TQ3 packed load: norms shape %s does not match n_groups=%d", norms.shape, n_groups)
+        raise RuntimeError(
+            f"TQ3 packed load: norms shape {tuple(norms.shape)} does not match n_groups={n_groups}"
+        )
     layer._tq_packed_shards.clear()
     layer._tq_norms_shards.clear()
     layer._tq_shard_order.clear()
@@ -695,6 +698,20 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 for expert_id in range(n_experts):
                     packed_parts = [moe_packed["pending_packed"][(param_name, sid, expert_id)] for sid in shard_ids]
                     norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
+                    packed_device = packed_parts[0].device
+                    packed_dtype = packed_parts[0].dtype
+                    if any(p.device != packed_device or p.dtype != packed_dtype for p in packed_parts[1:]):
+                        raise RuntimeError(
+                            f"TQ3 packed MoE: {param_name} packed shards have mixed device/dtype "
+                            f"(expected {packed_device}/{packed_dtype})."
+                        )
+                    norms_device = norms_parts[0].device
+                    norms_dtype = norms_parts[0].dtype
+                    if any(n.device != norms_device or n.dtype != norms_dtype for n in norms_parts[1:]):
+                        raise RuntimeError(
+                            f"TQ3 packed MoE: {param_name} norms shards have mixed device/dtype "
+                            f"(expected {norms_device}/{norms_dtype})."
+                        )
                     packed_all.append(torch.cat(packed_parts, dim=0))
                     norms_all.append(torch.cat(norms_parts, dim=0))
                 packed = torch.cat(packed_all, dim=0)
@@ -902,6 +919,13 @@ def _patch_weight_name_remapping():
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
+        if tq_cfg.get("format") != "tq3_native":
+            logger.info(
+                "tq_config.json format %s is not tq3_native; using default loader",
+                tq_cfg.get("format"),
+            )
+            yield from _original_get_all_weights(self, model_config, model)
+            return
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
