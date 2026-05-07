@@ -6,8 +6,9 @@ Three roles:
 2. Online quant methods (``TurboQuantOnlineLinearMethod``,
    ``TurboQuantOnlineMoEMethod``) compress bf16 → TQ3 per-layer after
    weight loading, keeping peak GPU memory at ~1 layer bf16.
-3. Patch ``DefaultModelLoader.get_all_weights`` to decompress native
-   TQ3 checkpoints (``.tq_packed`` / ``.tq_norms``) to bf16 on the fly.
+3. Patch ``DefaultModelLoader.get_all_weights`` to pass through native
+   TQ3 checkpoints (``.tq_packed`` / ``.tq_norms``) and bind packed
+   buffers directly, skipping bf16 decompression entirely.
 
 ``TurboQuantConfig`` MUST live at module top level. cloudpickle
 serializes closure-defined classes by value, transitively pulling in
@@ -24,6 +25,89 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+_TQ_PARAM_ATTRS = ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata")
+
+_PACKED_SHARD_ORDER = {
+    "q": 0,
+    "k": 1,
+    "v": 2,
+    "gate": 0,
+    "up": 1,
+    "w1": 0,
+    "w2": 1,
+    "w3": 2,
+}
+
+
+def _extract_weight_name(args: tuple, kwargs: dict) -> str | None:
+    for key in ("weight_name", "name", "param_name"):
+        val = kwargs.get(key)
+        if isinstance(val, str):
+            return val
+    for arg in args[2:]:
+        if isinstance(arg, str):
+            return arg
+    return None
+
+
+def _extract_shard_id(args: tuple, kwargs: dict) -> object | None:
+    if "shard_id" in kwargs:
+        return kwargs["shard_id"]
+    if "expert_id" in kwargs:
+        return None
+    if len(args) >= 3:
+        if isinstance(args[2], str) and ".tq_" in args[2]:
+            return None
+        return args[2]
+    return None
+
+
+def _ordered_shard_keys(keys: list[object]) -> list[object]:
+    if not keys:
+        return []
+    if all(isinstance(k, str) and k in _PACKED_SHARD_ORDER for k in keys):
+        return sorted(keys, key=lambda k: _PACKED_SHARD_ORDER[str(k)])
+    if all(isinstance(k, int) for k in keys):
+        return sorted(keys)
+    return list(keys)
+
+
+def _record_linear_packed(layer: nn.Module, shard_id: object | None, tensor: torch.Tensor, is_norms: bool) -> None:
+    if not hasattr(layer, "_tq_packed_shards"):
+        layer._tq_packed_shards = {}
+        layer._tq_norms_shards = {}
+        layer._tq_shard_order = []
+    key = shard_id if shard_id is not None else len(layer._tq_shard_order)
+    if key not in layer._tq_shard_order:
+        layer._tq_shard_order.append(key)
+    if is_norms:
+        layer._tq_norms_shards[key] = tensor
+    else:
+        layer._tq_packed_shards[key] = tensor
+    layer._tq_has_packed = True
+
+
+def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not getattr(layer, "_tq_has_packed", False):
+        return None
+    packed_shards = getattr(layer, "_tq_packed_shards", {})
+    norms_shards = getattr(layer, "_tq_norms_shards", {})
+    shard_order = _ordered_shard_keys(list(getattr(layer, "_tq_shard_order", [])))
+    if not packed_shards or not norms_shards:
+        return None
+    missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
+    if missing:
+        logger.warning("TQ3 packed load: missing shards for %s", missing)
+        return None
+    packed = torch.cat([packed_shards[key] for key in shard_order], dim=0)
+    norms = torch.cat([norms_shards[key] for key in shard_order], dim=0)
+    if norms.shape[1] != n_groups:
+        logger.warning("TQ3 packed load: norms shape %s does not match n_groups=%d", norms.shape, n_groups)
+    layer._tq_packed_shards.clear()
+    layer._tq_norms_shards.clear()
+    layer._tq_shard_order.clear()
+    return packed, norms
 
 # vLLM is an optional dependency — the package imports cleanly without
 # it (Mac/MLX-only paths). Class definitions below are guarded on the
@@ -133,9 +217,8 @@ if LinearBase is not None:
 
         Allocates bf16 weight on meta device (zero GPU at init). After
         weight loading materializes the bf16 on GPU, compress to TQ3
-        packed format. Single-pass decompression in get_all_weights
-        feeds bf16 to vLLM's standard weight routing (QKV stacking,
-        gate_up fusion) unchanged.
+        packed format. For native TQ3 checkpoints, packed buffers are
+        bound directly without bf16 decompression.
         """
 
         uses_meta_device: bool = True
@@ -161,6 +244,41 @@ if LinearBase is not None:
 
             output_size_per_partition = sum(output_partition_sizes)
             weight_loader = extra_weight_attrs.get("weight_loader")
+
+            if weight_loader is not None:
+                from turboquant_vllm.weight_quant import packed_group_bytes, padded_size
+
+                padded_in, n_groups = padded_size(input_size_per_partition, self.group_size)
+                bytes_per_group = packed_group_bytes(self.bits, self.group_size)
+
+                def _tq_weight_loader(param, loaded_weight, *args, **kwargs):
+                    if isinstance(loaded_weight, torch.Tensor):
+                        weight_name = _extract_weight_name(args, kwargs)
+                        shard_id = _extract_shard_id(args, kwargs)
+                        if weight_name is not None:
+                            if weight_name.endswith(".tq_packed"):
+                                _record_linear_packed(layer, shard_id, loaded_weight, is_norms=False)
+                                return True
+                            if weight_name.endswith(".tq_norms"):
+                                _record_linear_packed(layer, shard_id, loaded_weight, is_norms=True)
+                                return True
+                        if (
+                            loaded_weight.dtype == torch.uint8
+                            and loaded_weight.ndim == 2
+                            and loaded_weight.shape[1] == bytes_per_group
+                        ):
+                            _record_linear_packed(layer, shard_id, loaded_weight, is_norms=False)
+                            return True
+                        if (
+                            loaded_weight.is_floating_point()
+                            and loaded_weight.ndim == 2
+                            and loaded_weight.shape[1] == n_groups
+                        ):
+                            _record_linear_packed(layer, shard_id, loaded_weight, is_norms=True)
+                            return True
+                    return weight_loader(param, loaded_weight, *args, **kwargs)
+
+                weight_loader = _tq_weight_loader
 
             weight = ModelWeightParameter(
                 data=torch.empty(
@@ -189,6 +307,7 @@ if LinearBase is not None:
                 _tq_fwht_input_fn,
                 _triton_available,
                 pack_indices,
+                packed_group_bytes,
                 padded_size,
             )
 
@@ -198,6 +317,46 @@ if LinearBase is not None:
 
             out_dim, in_dim = weight.shape
             padded_in, n_groups = padded_size(in_dim, group_size)
+
+            packed_pair = _consume_linear_packed(layer, n_groups)
+            if packed_pair is not None:
+                packed, norms = packed_pair
+                if norms.shape[0] != out_dim:
+                    out_dim = norms.shape[0]
+
+                layer.weight.data = torch.empty(0, device=packed.device, dtype=weight.dtype)
+                layer.register_buffer("tq_packed_weight", packed)
+                layer.register_buffer("tq_norms", norms)
+                quantizer = _get_quantizer(group_size, bits, str(packed.device))
+                layer.register_buffer("tq_signs1", quantizer.signs1)
+                layer.register_buffer("tq_signs2", quantizer.signs2)
+                layer.register_buffer("tq_centroids", quantizer.centroids)
+                arch_ok = torch.cuda.is_available() and torch.cuda.get_device_capability(packed.device)[0] >= 8
+                if bits == 3 and group_size == 128 and arch_ok:
+                    bytes_per_group = packed_group_bytes(bits, group_size)
+                    layer.register_buffer(
+                        "tq_packed_bs1",
+                        packed.view(out_dim * n_groups, bytes_per_group),
+                    )
+                    layer.register_buffer("tq_norms_bf16", norms.to(torch.bfloat16))
+                    layer.register_buffer(
+                        "tq_centroids_bf16",
+                        quantizer.centroids.to(torch.bfloat16),
+                    )
+                layer.tq_in_features = in_dim
+                layer.tq_out_features = out_dim
+                layer.tq_padded_in = padded_in
+
+                _ensure_triton_backends()
+                _get_cuda_module()
+                if _triton_available:
+                    layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
+                    layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
+                else:
+                    layer._tq_primary_fn = None
+
+                layer._already_called_process_weights_after_loading = True
+                return
 
             if padded_in > in_dim:
                 padded = torch.zeros(
@@ -365,7 +524,7 @@ def _materialize_and_process(
             real_param = torch.nn.Parameter(real, requires_grad=False)
             if name in orig_loaders:
                 real_param.weight_loader = orig_loaders[name]
-            for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata"):
+            for attr in _TQ_PARAM_ATTRS:
                 if hasattr(param, attr):
                     setattr(real_param, attr, getattr(param, attr))
             delattr(layer, name)
@@ -382,6 +541,30 @@ def _materialize_and_process(
 
     # 3. Kernel setup + compress
     method._do_compress(layer)
+
+
+def _materialize_packed_moe(
+    layer: nn.Module,
+    orig_loaders: dict[str, Any],
+    param_shapes: dict[str, tuple],
+    param_dtypes: dict[str, torch.dtype],
+    device: torch.device,
+    packed_param_names: set[str],
+) -> None:
+    for name, param in list(layer.named_parameters(recurse=False)):
+        if param.device == torch.device("meta") and name in param_shapes:
+            if name in packed_param_names:
+                real = torch.empty(0, dtype=param_dtypes[name], device=device)
+            else:
+                real = torch.empty(param_shapes[name], dtype=param_dtypes[name], device=device)
+            real_param = torch.nn.Parameter(real, requires_grad=False)
+            if name in orig_loaders:
+                real_param.weight_loader = orig_loaders[name]
+            for attr in _TQ_PARAM_ATTRS:
+                if hasattr(param, attr):
+                    setattr(real_param, attr, getattr(param, attr))
+            delattr(layer, name)
+            layer.register_parameter(name, real_param)
 
 
 if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
@@ -431,7 +614,7 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                     )
                     if hasattr(param, "weight_loader"):
                         meta_param.weight_loader = param.weight_loader
-                    for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata"):
+                    for attr in _TQ_PARAM_ATTRS:
                         if hasattr(param, attr):
                             setattr(meta_param, attr, getattr(param, attr))
                     delattr(layer, name)
@@ -444,12 +627,112 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             buffer: list[tuple[str, tuple, dict]] = []
             loaded_numel = [0]
             materialized = [False]
+            moe_packed = {
+                "pending_packed": {},
+                "pending_norms": {},
+                "shard_order": {"w13_weight": [], "w2_weight": []},
+                "device": None,
+            }
+
+            def _moe_dims(param_name: str) -> tuple[int, int]:
+                from turboquant_vllm.weight_quant import packed_group_bytes, padded_size
+
+                shape = param_shapes[param_name]
+                in_dim = shape[-1]
+                _, n_groups = padded_size(in_dim, self.group_size)
+                bytes_per_group = packed_group_bytes(self.bits, self.group_size)
+                return n_groups, bytes_per_group
+
+            def _record_packed_moe(param_name: str, loaded_weight: torch.Tensor, args, kwargs) -> bool:
+                if not isinstance(loaded_weight, torch.Tensor):
+                    return False
+                weight_name = _extract_weight_name(args, kwargs)
+                is_packed = weight_name is not None and weight_name.endswith(".tq_packed")
+                is_norms = weight_name is not None and weight_name.endswith(".tq_norms")
+                n_groups, bytes_per_group = _moe_dims(param_name)
+                if not is_packed and loaded_weight.dtype == torch.uint8 and loaded_weight.ndim == 2:
+                    is_packed = loaded_weight.shape[1] == bytes_per_group
+                if not is_norms and loaded_weight.is_floating_point() and loaded_weight.ndim == 2:
+                    is_norms = loaded_weight.shape[1] == n_groups
+                if not (is_packed or is_norms):
+                    return False
+                expert_id = kwargs.get("expert_id")
+                if expert_id is None and len(args) >= 3 and isinstance(args[2], int):
+                    expert_id = args[2]
+                if expert_id is None:
+                    return False
+                shard_id = kwargs.get("shard_id")
+                key = (param_name, shard_id, expert_id)
+                order = moe_packed["shard_order"][param_name]
+                if shard_id not in order:
+                    order.append(shard_id)
+                if is_packed:
+                    moe_packed["pending_packed"][key] = loaded_weight
+                if is_norms:
+                    moe_packed["pending_norms"][key] = loaded_weight
+                moe_packed["device"] = loaded_weight.device
+                return True
+
+            def _packed_complete(param_name: str) -> bool:
+                shard_ids = moe_packed["shard_order"][param_name]
+                if not shard_ids:
+                    return False
+                n_experts = param_shapes[param_name][0]
+                for shard_id in shard_ids:
+                    for expert_id in range(n_experts):
+                        key = (param_name, shard_id, expert_id)
+                        if key not in moe_packed["pending_packed"] or key not in moe_packed["pending_norms"]:
+                            return False
+                return True
+
+            def _build_moe_compressed(param_name: str) -> "Compressed3D":
+                from turboquant_vllm.weight_quant import Compressed3D
+
+                shard_ids = _ordered_shard_keys(moe_packed["shard_order"][param_name])
+                n_experts = param_shapes[param_name][0]
+                packed_all = []
+                norms_all = []
+                for expert_id in range(n_experts):
+                    packed_parts = [moe_packed["pending_packed"][(param_name, sid, expert_id)] for sid in shard_ids]
+                    norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
+                    packed_all.append(torch.cat(packed_parts, dim=0))
+                    norms_all.append(torch.cat(norms_parts, dim=0))
+                packed = torch.cat(packed_all, dim=0)
+                norms = torch.cat(norms_all, dim=0)
+                return Compressed3D.from_packed(
+                    packed,
+                    norms,
+                    shape=tuple(param_shapes[param_name]),
+                    dtype=param_dtypes[param_name],
+                    bits=self.bits,
+                    group_size=self.group_size,
+                )
 
             def _make_buffering_loader(param_name, orig_loader):
                 def _buffering_loader(*args, **kwargs):
                     if materialized[0]:
                         return orig_loader(*args, **kwargs)
                     loaded_weight = args[1] if len(args) > 1 else None
+                    if isinstance(loaded_weight, torch.Tensor) and _record_packed_moe(
+                        param_name, loaded_weight, args, kwargs
+                    ):
+                        if _packed_complete("w13_weight") and _packed_complete("w2_weight"):
+                            materialized[0] = True
+                            layer._tq_w13_weight = _build_moe_compressed("w13_weight")
+                            layer._tq_w2_weight = _build_moe_compressed("w2_weight")
+                            device = moe_packed["device"] or layer._tq_w13_weight.packed.device
+                            _materialize_packed_moe(
+                                layer,
+                                orig_loaders,
+                                param_shapes,
+                                param_dtypes,
+                                device,
+                                {"w13_weight", "w2_weight"},
+                            )
+                            moe_packed["pending_packed"].clear()
+                            moe_packed["pending_norms"].clear()
+                            self._do_compress(layer)
+                        return True
                     numel = loaded_weight.numel() if isinstance(loaded_weight, torch.Tensor) else 0
                     buffer.append((param_name, args, kwargs))
                     loaded_numel[0] += numel
@@ -482,15 +765,17 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
             from turboquant_vllm.weight_quant import _compress_3d_param
 
-            self._unquant.process_weights_after_loading(layer)
+            prepacked = hasattr(layer, "_tq_w13_weight") and hasattr(layer, "_tq_w2_weight")
 
             w13 = getattr(layer, "w13_weight", None)
             w2 = getattr(layer, "w2_weight", None)
             if w13 is None or w2 is None or w13.dim() != 3 or w2.dim() != 3:
                 return
 
-            _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
-            _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
+            if not prepacked:
+                self._unquant.process_weights_after_loading(layer)
+                _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
+                _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
 
             self._w13_c = layer._tq_w13_weight
             self._w2_c = layer._tq_w2_weight
@@ -509,6 +794,9 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             self._pool = _shared_moe_scratch_pool
             layer.w13_weight.data = self._pool.w13
             layer.w2_weight.data = self._pool.w2
+
+            if prepacked:
+                self._unquant.process_weights_after_loading(layer)
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -573,36 +861,21 @@ _FP8_LEFTOVER_SCALE_SUFFIXES = (
 
 
 def _patch_weight_name_remapping():
-    """Monkey-patch vLLM's weight iterator to decompress TQ3 weights on load.
+    """Monkey-patch vLLM's weight iterator to pass through TQ3 packed weights.
 
-    Single-pass: as each ``.tq_packed`` / ``.tq_norms`` pair arrives
-    from the checkpoint iterator, decompress to bf16 and yield with the
-    original ``.weight`` name.  vLLM's model-specific weight loaders
-    (stacked qkv, fused gate_up, expert assembly) work unchanged.
-
-    CPU memory is bounded by the online processing buffer for currently-
-    loading modules (typically 1-2 decoder layers).  The bf16 is transient
-    — ``process_weights_after_loading`` compresses to TQ3 on GPU.
+    As each ``.tq_packed`` / ``.tq_norms`` tensor arrives from the
+    checkpoint iterator, yield it directly so TurboQuant's quant methods
+    can bind packed buffers on GPU without bf16 decompression.
     """
     try:
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
     except ImportError:
         return
 
-    from turboquant_vllm.weight_quant import Compressed3D
-
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        """Decompress TQ3 → bf16 per tensor, single-pass.
-
-        Pairs ``.tq_packed`` + ``.tq_norms`` as they arrive from the
-        checkpoint iterator, decompresses to bf16 immediately, and yields
-        with the original ``.weight`` name. No collection / buffering of
-        packed tensors — CPU memory is bounded by whichever tensors the
-        online processing is currently accumulating for incomplete modules
-        (typically 1-2 decoder layers worth of bf16).
-        """
+        """Pass through ``.tq_packed`` + ``.tq_norms`` tensors as-is."""
         import os as _os
 
         tq_config_path = _os.path.join(model_config.model, "tq_config.json")
@@ -632,65 +905,47 @@ def _patch_weight_name_remapping():
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
-            "TQ3 native checkpoint (bits=%d, group_size=%d): single-pass decompress-on-load",
+            "TQ3 native checkpoint (bits=%d, group_size=%d): direct packed load",
             bits,
             group_size,
         )
 
-        pending_packed: dict[str, torch.Tensor] = {}
-        pending_norms: dict[str, torch.Tensor] = {}
-        decompressed = 0
+        pending_packed: set[str] = set()
+        pending_norms: set[str] = set()
         skipped_fp8_scales = 0
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
-            if name.endswith(".weight.tq_packed"):
+            if name.endswith(".tq_packed"):
                 base = name[: -len(".tq_packed")]
-                pending_packed[base] = tensor
-            elif name.endswith(".weight.tq_norms"):
+                if base in pending_norms:
+                    pending_norms.remove(base)
+                else:
+                    pending_packed.add(base)
+                yield name, tensor
+            elif name.endswith(".tq_norms"):
                 base = name[: -len(".tq_norms")]
-                pending_norms[base] = tensor
+                if base in pending_packed:
+                    pending_packed.remove(base)
+                else:
+                    pending_norms.add(base)
+                yield name, tensor
             elif name.endswith(_FP8_LEFTOVER_SCALE_SUFFIXES):
                 skipped_fp8_scales += 1
                 continue
             else:
                 yield name, tensor
-                continue
 
-            # When both halves of a pair arrive, decompress and yield
-            if base in pending_packed and base in pending_norms:
-                packed = pending_packed.pop(base)
-                norms = pending_norms.pop(base)
-
-                n_rows = norms.shape[0]
-                n_groups = norms.shape[1]
-                in_dim = n_groups * group_size
-                comp = Compressed3D.from_packed(
-                    packed,
-                    norms,
-                    (1, n_rows, in_dim),
-                    torch.bfloat16,
-                    bits,
-                    group_size,
-                )
-                w = comp.decompress().squeeze(0)
-                decompressed += 1
-                if decompressed % 200 == 0:
-                    logger.info("  Decompressed %d tensors", decompressed)
-                yield base, w
-                del packed, norms, comp, w
-
-        if decompressed > 0:
-            logger.info("TQ3 decompression complete: %d tensors", decompressed)
+        if pending_packed:
+            for base in sorted(pending_packed):
+                logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
+        if pending_norms:
+            for base in sorted(pending_norms):
+                logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
         if skipped_fp8_scales > 0:
             logger.info(
                 "TQ3 native: dropped %d FP8 leftover scale tensors",
                 skipped_fp8_scales,
             )
 
-        for base in pending_packed:
-            logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
-        for base in pending_norms:
-            logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
-
     DefaultModelLoader.get_all_weights = _decompress_get_all_weights
-    logger.info("TQ3 decompress-on-load hook installed on DefaultModelLoader.get_all_weights")
+    logger.info("TQ3 packed-load hook installed on DefaultModelLoader.get_all_weights")

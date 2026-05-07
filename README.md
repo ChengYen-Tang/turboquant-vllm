@@ -387,7 +387,7 @@ save_tq3_checkpoint("zai-org/GLM-4.7-Flash", "./glm47-tq3")
 
 ### Serving native TQ3 checkpoints with vLLM
 
-For models too large to fit in GPU memory even as BF16 (e.g., GLM-5.1 at 1,508 GB), native TQ3 checkpoints can be served directly through vLLM with `--quantization turboquant`. This uses **meta-device initialization** — the model architecture is allocated with zero GPU memory, then weights are decompressed from TQ3→BF16 and re-compressed to TQ3 on GPU one layer at a time:
+For models too large to fit in GPU memory even as BF16 (e.g., GLM-5.1 at 1,508 GB), native TQ3 checkpoints can be served directly through vLLM with `--quantization turboquant`. This uses **meta-device initialization** — the model architecture is allocated with zero GPU memory, then packed weights are streamed to GPU and bound directly without any BF16 decompression:
 
 ```bash
 # GLM-5.1 (754B) on 2×H200 — impossible without TQ3 (needs 754 GB BF16)
@@ -401,10 +401,9 @@ vllm serve varjosoft/GLM-5.1-Open-TQ3 \
 How it works:
 1. `TurboQuantOnlineLinearMethod` and `TurboQuantOnlineMoEMethod` set `uses_meta_device=True`
 2. Model init allocates zero GPU memory (all weights on meta device)
-3. `get_all_weights` hook decompresses `.tq_packed`/`.tq_norms` → BF16 per tensor
-4. vLLM's online processing buffers one layer at a time, materializes on GPU
-5. `process_weights_after_loading` compresses BF16→TQ3 on GPU per layer
-6. Peak memory: ~1 layer BF16 + all previous layers compressed
+3. `get_all_weights` yields `.tq_packed`/`.tq_norms` directly from the checkpoint
+4. TurboQuant quant methods bind packed buffers and set up kernels/scratch pools
+5. Peak memory: packed weights + scratch pools, with no BF16 decompression peak
 
 This is the same pattern vLLM uses for online FP8 quantization. No `TQ_WEIGHT_BITS` env var needed — the quantization config is read from `tq_config.json` in the checkpoint.
 

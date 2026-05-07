@@ -108,7 +108,7 @@ def save_tq3_checkpoint(
     # treats models with quantization_config differently during
     # compilation and CUDA graph capture.  Instead, tq_config.json
     # (written at the end of this function) is the sole marker.
-    # The decompress-on-load hook in vllm_quant.py detects it.
+    # The packed-load hook in vllm_quant.py detects it.
     if hasattr(config, "quantization_config"):
         config.quantization_config = None
     config.save_pretrained(output_dir)
