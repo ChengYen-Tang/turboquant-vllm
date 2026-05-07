@@ -95,12 +95,12 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
     norms_shards = getattr(layer, "_tq_norms_shards", {})
     shard_order = _ordered_shard_keys(list(getattr(layer, "_tq_shard_order", [])))
     if not packed_shards or not norms_shards:
-        missing_kinds = []
-        if not packed_shards:
-            missing_kinds.append(".tq_packed")
-        if not norms_shards:
-            missing_kinds.append(".tq_norms")
-        raise RuntimeError(f"TQ3 packed load failed: missing {', '.join(missing_kinds)} shards.")
+        missing_kinds = ", ".join(
+            kind
+            for kind, present in ((".tq_packed", packed_shards), (".tq_norms", norms_shards))
+            if not present
+        )
+        raise RuntimeError(f"TQ3 packed load failed: missing {missing_kinds} shards.")
     missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
     if missing:
         raise RuntimeError(f"TQ3 packed load missing shards: {missing}")
@@ -691,33 +691,36 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                             return False
                 return True
 
+            def _validate_device_dtype_consistency(
+                parts: list[torch.Tensor],
+                label: str,
+                param_name: str,
+            ) -> None:
+                device = parts[0].device
+                dtype = parts[0].dtype
+                mismatches = [
+                    (index, part.device, part.dtype)
+                    for index, part in enumerate(parts[1:], start=1)
+                    if part.device != device or part.dtype != dtype
+                ]
+                if mismatches:
+                    raise RuntimeError(
+                        f"TQ3 packed MoE: {param_name} {label} shards have mixed device/dtype "
+                        f"(expected {device}/{dtype}, mismatches={mismatches})."
+                    )
+
             def _build_moe_compressed(param_name: str) -> "Compressed3D":
                 from turboquant_vllm.weight_quant import Compressed3D
 
                 shard_ids = _ordered_shard_keys(moe_packed["shard_order"][param_name])
                 n_experts = param_shapes[param_name][0]
-
-                def _validate_device_dtype_consistency(parts: list[torch.Tensor], label: str) -> None:
-                    device = parts[0].device
-                    dtype = parts[0].dtype
-                    mismatches = [
-                        (index, part.device, part.dtype)
-                        for index, part in enumerate(parts[1:], start=1)
-                        if part.device != device or part.dtype != dtype
-                    ]
-                    if mismatches:
-                        raise RuntimeError(
-                            f"TQ3 packed MoE: {param_name} {label} shards have mixed device/dtype "
-                            f"(expected {device}/{dtype}, mismatches={mismatches})."
-                        )
-
                 packed_all = []
                 norms_all = []
                 for expert_id in range(n_experts):
                     packed_parts = [moe_packed["pending_packed"][(param_name, sid, expert_id)] for sid in shard_ids]
                     norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
-                    _validate_device_dtype_consistency(packed_parts, "packed")
-                    _validate_device_dtype_consistency(norms_parts, "norms")
+                    _validate_device_dtype_consistency(packed_parts, "packed", param_name)
+                    _validate_device_dtype_consistency(norms_parts, "norms", param_name)
                     packed_all.append(torch.cat(packed_parts, dim=0))
                     norms_all.append(torch.cat(norms_parts, dim=0))
                 packed = torch.cat(packed_all, dim=0)
