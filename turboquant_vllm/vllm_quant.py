@@ -95,11 +95,12 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
     norms_shards = getattr(layer, "_tq_norms_shards", {})
     shard_order = _ordered_shard_keys(list(getattr(layer, "_tq_shard_order", [])))
     if not packed_shards or not norms_shards:
-        missing_kinds = ", ".join(
-            kind
-            for kind, present in ((".tq_packed", bool(packed_shards)), (".tq_norms", bool(norms_shards)))
-            if not present
-        )
+        missing_kinds = []
+        if not packed_shards:
+            missing_kinds.append(".tq_packed")
+        if not norms_shards:
+            missing_kinds.append(".tq_norms")
+        missing_kinds = ", ".join(missing_kinds)
         raise RuntimeError(f"TQ3 packed load failed: missing {missing_kinds} shards.")
     missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
     if missing:
@@ -929,7 +930,7 @@ def _patch_weight_name_remapping():
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
-        format_name = tq_cfg.get("format") or "unknown"
+        format_name = tq_cfg.get("format", "unknown")
         if format_name != "tq3_native":
             logger.info(
                 "tq_config.json format %s is not tq3_native; using default loader",
