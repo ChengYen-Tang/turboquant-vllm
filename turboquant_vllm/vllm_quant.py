@@ -97,7 +97,7 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
     if not packed_shards or not norms_shards:
         missing_kinds = ", ".join(
             kind
-            for kind, present in ((".tq_packed", packed_shards), (".tq_norms", norms_shards))
+            for kind, present in ((".tq_packed", bool(packed_shards)), (".tq_norms", bool(norms_shards)))
             if not present
         )
         raise RuntimeError(f"TQ3 packed load failed: missing {missing_kinds} shards.")
@@ -699,14 +699,15 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 device = parts[0].device
                 dtype = parts[0].dtype
                 mismatches = [
-                    (index, part.device, part.dtype)
+                    f"{index}: {part.device}/{part.dtype}"
                     for index, part in enumerate(parts[1:], start=1)
                     if part.device != device or part.dtype != dtype
                 ]
                 if mismatches:
+                    mismatch_desc = ", ".join(mismatches)
                     raise RuntimeError(
                         f"TQ3 packed MoE: {param_name} {label} shards have mixed device/dtype "
-                        f"(expected {device}/{dtype}, mismatches={mismatches})."
+                        f"(expected {device}/{dtype}, mismatches={mismatch_desc})."
                     )
 
             def _build_moe_compressed(param_name: str) -> "Compressed3D":
