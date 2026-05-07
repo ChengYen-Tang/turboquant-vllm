@@ -95,8 +95,13 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
     norms_shards = getattr(layer, "_tq_norms_shards", {})
     shard_order = _ordered_shard_keys(list(getattr(layer, "_tq_shard_order", [])))
     if not packed_shards or not norms_shards:
+        missing_kinds = []
+        if not packed_shards:
+            missing_kinds.append(".tq_packed")
+        if not norms_shards:
+            missing_kinds.append(".tq_norms")
         raise RuntimeError(
-            "TQ3 packed load expected both .tq_packed and .tq_norms shards, but some are missing."
+            f"TQ3 packed load expected shards for {', '.join(missing_kinds)}, but none were loaded."
         )
     missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
     if missing:
@@ -700,17 +705,27 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                     norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
                     packed_device = packed_parts[0].device
                     packed_dtype = packed_parts[0].dtype
-                    if any(p.device != packed_device or p.dtype != packed_dtype for p in packed_parts[1:]):
+                    packed_mismatch = [
+                        (index, part.device, part.dtype)
+                        for index, part in enumerate(packed_parts[1:], start=1)
+                        if part.device != packed_device or part.dtype != packed_dtype
+                    ]
+                    if packed_mismatch:
                         raise RuntimeError(
                             f"TQ3 packed MoE: {param_name} packed shards have mixed device/dtype "
-                            f"(expected {packed_device}/{packed_dtype})."
+                            f"(expected {packed_device}/{packed_dtype}, mismatches={packed_mismatch})."
                         )
                     norms_device = norms_parts[0].device
                     norms_dtype = norms_parts[0].dtype
-                    if any(n.device != norms_device or n.dtype != norms_dtype for n in norms_parts[1:]):
+                    norms_mismatch = [
+                        (index, part.device, part.dtype)
+                        for index, part in enumerate(norms_parts[1:], start=1)
+                        if part.device != norms_device or part.dtype != norms_dtype
+                    ]
+                    if norms_mismatch:
                         raise RuntimeError(
                             f"TQ3 packed MoE: {param_name} norms shards have mixed device/dtype "
-                            f"(expected {norms_device}/{norms_dtype})."
+                            f"(expected {norms_device}/{norms_dtype}, mismatches={norms_mismatch})."
                         )
                     packed_all.append(torch.cat(packed_parts, dim=0))
                     norms_all.append(torch.cat(norms_parts, dim=0))
