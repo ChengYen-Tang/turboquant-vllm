@@ -100,9 +100,7 @@ def _consume_linear_packed(layer: nn.Module, n_groups: int) -> tuple[torch.Tenso
             missing_kinds.append(".tq_packed")
         if not norms_shards:
             missing_kinds.append(".tq_norms")
-        raise RuntimeError(
-            f"TQ3 packed load expected shards for {', '.join(missing_kinds)}, but none were loaded."
-        )
+        raise RuntimeError(f"TQ3 packed load failed: missing {', '.join(missing_kinds)} shards.")
     missing = [key for key in shard_order if key not in packed_shards or key not in norms_shards]
     if missing:
         raise RuntimeError(f"TQ3 packed load missing shards: {missing}")
@@ -699,7 +697,7 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 shard_ids = _ordered_shard_keys(moe_packed["shard_order"][param_name])
                 n_experts = param_shapes[param_name][0]
 
-                def _ensure_same_device_dtype(parts: list[torch.Tensor], label: str) -> None:
+                def _validate_device_dtype_consistency(parts: list[torch.Tensor], label: str) -> None:
                     device = parts[0].device
                     dtype = parts[0].dtype
                     mismatches = [
@@ -718,8 +716,8 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 for expert_id in range(n_experts):
                     packed_parts = [moe_packed["pending_packed"][(param_name, sid, expert_id)] for sid in shard_ids]
                     norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
-                    _ensure_same_device_dtype(packed_parts, "packed")
-                    _ensure_same_device_dtype(norms_parts, "norms")
+                    _validate_device_dtype_consistency(packed_parts, "packed")
+                    _validate_device_dtype_consistency(norms_parts, "norms")
                     packed_all.append(torch.cat(packed_parts, dim=0))
                     norms_all.append(torch.cat(norms_parts, dim=0))
                 packed = torch.cat(packed_all, dim=0)
@@ -927,7 +925,7 @@ def _patch_weight_name_remapping():
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
-        format_name = tq_cfg.get("format")
+        format_name = tq_cfg.get("format") or "unknown"
         if format_name != "tq3_native":
             logger.info(
                 "tq_config.json format %s is not tq3_native; using default loader",
