@@ -698,35 +698,28 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
                 shard_ids = _ordered_shard_keys(moe_packed["shard_order"][param_name])
                 n_experts = param_shapes[param_name][0]
+
+                def _ensure_same_device_dtype(parts: list[torch.Tensor], label: str) -> None:
+                    device = parts[0].device
+                    dtype = parts[0].dtype
+                    mismatches = [
+                        (index, part.device, part.dtype)
+                        for index, part in enumerate(parts[1:], start=1)
+                        if part.device != device or part.dtype != dtype
+                    ]
+                    if mismatches:
+                        raise RuntimeError(
+                            f"TQ3 packed MoE: {param_name} {label} shards have mixed device/dtype "
+                            f"(expected {device}/{dtype}, mismatches={mismatches})."
+                        )
+
                 packed_all = []
                 norms_all = []
                 for expert_id in range(n_experts):
                     packed_parts = [moe_packed["pending_packed"][(param_name, sid, expert_id)] for sid in shard_ids]
                     norms_parts = [moe_packed["pending_norms"][(param_name, sid, expert_id)] for sid in shard_ids]
-                    packed_device = packed_parts[0].device
-                    packed_dtype = packed_parts[0].dtype
-                    packed_mismatch = [
-                        (index, part.device, part.dtype)
-                        for index, part in enumerate(packed_parts[1:], start=1)
-                        if part.device != packed_device or part.dtype != packed_dtype
-                    ]
-                    if packed_mismatch:
-                        raise RuntimeError(
-                            f"TQ3 packed MoE: {param_name} packed shards have mixed device/dtype "
-                            f"(expected {packed_device}/{packed_dtype}, mismatches={packed_mismatch})."
-                        )
-                    norms_device = norms_parts[0].device
-                    norms_dtype = norms_parts[0].dtype
-                    norms_mismatch = [
-                        (index, part.device, part.dtype)
-                        for index, part in enumerate(norms_parts[1:], start=1)
-                        if part.device != norms_device or part.dtype != norms_dtype
-                    ]
-                    if norms_mismatch:
-                        raise RuntimeError(
-                            f"TQ3 packed MoE: {param_name} norms shards have mixed device/dtype "
-                            f"(expected {norms_device}/{norms_dtype}, mismatches={norms_mismatch})."
-                        )
+                    _ensure_same_device_dtype(packed_parts, "packed")
+                    _ensure_same_device_dtype(norms_parts, "norms")
                     packed_all.append(torch.cat(packed_parts, dim=0))
                     norms_all.append(torch.cat(norms_parts, dim=0))
                 packed = torch.cat(packed_all, dim=0)
@@ -934,10 +927,11 @@ def _patch_weight_name_remapping():
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
-        if tq_cfg.get("format") != "tq3_native":
+        format_name = tq_cfg.get("format")
+        if format_name != "tq3_native":
             logger.info(
                 "tq_config.json format %s is not tq3_native; using default loader",
-                tq_cfg.get("format"),
+                format_name,
             )
             yield from _original_get_all_weights(self, model_config, model)
             return
