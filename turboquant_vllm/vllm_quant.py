@@ -957,6 +957,15 @@ def _patch_weight_name_remapping():
                 return base + suffix, base
             return name, base
 
+        def _expand_weight_names(name: str) -> list[str]:
+            variants = [name]
+            for prefix in ("model.model.", "model."):
+                if name.startswith(prefix):
+                    stripped = name[len(prefix) :]
+                    if stripped not in variants:
+                        variants.append(stripped)
+            return variants
+
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".tq_packed"):
                 canonical_name, base = _canonical_tq_name(name, ".tq_packed")
@@ -964,19 +973,22 @@ def _patch_weight_name_remapping():
                     pending_norms.remove(base)
                 else:
                     pending_packed.add(base)
-                yield canonical_name, tensor
+                for mapped_name in _expand_weight_names(canonical_name):
+                    yield mapped_name, tensor
             elif name.endswith(".tq_norms"):
                 canonical_name, base = _canonical_tq_name(name, ".tq_norms")
                 if base in pending_packed:
                     pending_packed.remove(base)
                 else:
                     pending_norms.add(base)
-                yield canonical_name, tensor
+                for mapped_name in _expand_weight_names(canonical_name):
+                    yield mapped_name, tensor
             elif name.endswith(_FP8_LEFTOVER_SCALE_SUFFIXES):
                 skipped_fp8_scales += 1
                 continue
             else:
-                yield name, tensor
+                for mapped_name in _expand_weight_names(name):
+                    yield mapped_name, tensor
 
         if pending_packed:
             for base in sorted(pending_packed):
