@@ -950,21 +950,28 @@ def _patch_weight_name_remapping():
         pending_norms: set[str] = set()
         skipped_fp8_scales = 0
 
+        def _canonical_tq_name(name: str, suffix: str) -> tuple[str, str]:
+            base = name[: -len(suffix)]
+            if base.endswith(".weight"):
+                base = base[: -len(".weight")]
+                return base + suffix, base
+            return name, base
+
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".tq_packed"):
-                base = name[: -len(".tq_packed")]
+                canonical_name, base = _canonical_tq_name(name, ".tq_packed")
                 if base in pending_norms:
                     pending_norms.remove(base)
                 else:
                     pending_packed.add(base)
-                yield name, tensor
+                yield canonical_name, tensor
             elif name.endswith(".tq_norms"):
-                base = name[: -len(".tq_norms")]
+                canonical_name, base = _canonical_tq_name(name, ".tq_norms")
                 if base in pending_packed:
                     pending_packed.remove(base)
                 else:
                     pending_norms.add(base)
-                yield name, tensor
+                yield canonical_name, tensor
             elif name.endswith(_FP8_LEFTOVER_SCALE_SUFFIXES):
                 skipped_fp8_scales += 1
                 continue
