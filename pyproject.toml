@@ -35,6 +35,7 @@ Homepage = "https://github.com/varjoranta/turboquant-vllm"
 
 [tool.hatch.build.targets.wheel]
 packages = ["turboquant_vllm", "csrc"]
+artifacts = ["turboquant_vllm/_native/*.so"]
 
 [build-system]
 requires = ["hatchling"]

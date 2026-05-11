@@ -56,8 +56,12 @@ class TurboQuantFusedMoEScratchPool:
         bf16_dtype = w13_compressed.dtype
         self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=device)
         self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w13_fp32 = torch.zeros(w13_compressed.shape, dtype=torch.float32, device=device)
-        self.w2_fp32 = torch.zeros(w2_compressed.shape, dtype=torch.float32, device=device)
+        # The CUDA sparse expert dequant path writes directly into the
+        # destination dtype and ignores fp32 scratch. Keep these as
+        # lazy/optional placeholders so we don't reserve another full
+        # pair of expert buffers on every model by default.
+        self.w13_fp32 = None
+        self.w2_fp32 = None
         self.shape_w13 = w13_compressed.shape
         self.shape_w2 = w2_compressed.shape
 
@@ -163,6 +167,38 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ):
+        def _collect_meta_tensors(obj, prefix: str, depth: int = 0, max_depth: int = 2):
+            hits: list[str] = []
+            if obj is None or depth > max_depth:
+                return hits
+            if isinstance(obj, torch.Tensor):
+                if obj.is_meta:
+                    hits.append(f"{prefix}: shape={tuple(obj.shape)} dtype={obj.dtype}")
+                return hits
+            if isinstance(obj, (list, tuple)):
+                for idx, item in enumerate(obj):
+                    hits.extend(_collect_meta_tensors(item, f"{prefix}[{idx}]", depth + 1, max_depth))
+                return hits
+            if isinstance(obj, dict):
+                for key, item in obj.items():
+                    hits.extend(_collect_meta_tensors(item, f"{prefix}.{key}", depth + 1, max_depth))
+                return hits
+            for name in dir(obj):
+                if name.startswith("__"):
+                    continue
+                try:
+                    value = getattr(obj, name)
+                except Exception:
+                    continue
+                if callable(value):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    if value.is_meta:
+                        hits.append(f"{prefix}.{name}: shape={tuple(value.shape)} dtype={value.dtype}")
+                elif depth < max_depth and hasattr(value, "__dict__"):
+                    hits.extend(_collect_meta_tensors(value, f"{prefix}.{name}", depth + 1, max_depth))
+            return hits
+
         # ``layer.w13_weight.data`` / ``layer.w2_weight.data`` were
         # re-pointed at ``pool.w13`` / ``pool.w2`` at install time, so
         # writing into the pool buffers here makes the freshly
@@ -179,6 +215,17 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             active_experts = active_experts.to(torch.int32)
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
         self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
+
+        meta_hits = []
+        meta_hits.extend(_collect_meta_tensors(layer.w13_weight, "layer.w13_weight"))
+        meta_hits.extend(_collect_meta_tensors(layer.w2_weight, "layer.w2_weight"))
+        meta_hits.extend(_collect_meta_tensors(getattr(layer, "expert_map", None), "layer.expert_map"))
+        meta_hits.extend(_collect_meta_tensors(getattr(layer, "base_quant_method", None), "layer.base_quant_method"))
+        if meta_hits:
+            raise RuntimeError(
+                "TurboQuant detected meta tensors before MoE kernel apply: "
+                + "; ".join(meta_hits[:20])
+            )
 
         return layer.base_quant_method.apply(
             layer=layer,
